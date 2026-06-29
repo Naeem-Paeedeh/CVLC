@@ -1,0 +1,98 @@
+{
+    "prefix": "CVLC",
+    "experiment_description": "",
+    "dataset_name": "domainnet",
+    "data_path": "/newEra/shared/Datasets/DIL/DomainNet",
+    "total_sessions" : 6,
+    "order": 6,
+    "num_shots": 4,
+    "shuffle": true,
+    "backbone_type": "BackboneType.CLIP_ViT_B16",
+    "batch_size": 128,
+    "num_workers": 8,
+    "synonyms_json_file_path": "descriptions/synonyms.json",
+    "prototype_calculation_mode_text": "PrototypeTextModality.Templates",
+    "max_num_descriptions": 10,
+    
+    "peft_for_new_domain": "InitializationApproachForIncrementalTasks.CopyFromFirstDomain",
+
+    "MA_loss_capacity": 200,
+    "MA_loss_threshold_for_early_stopping": 0.0,
+
+    "use_checkpinting": true,
+    "max_number_of_embeddings_for_statistics": 100000,
+
+    "enable_vision_CPs": true,
+    "enable_text_CPs": true,
+    "shared_CPs_shared_across_heads": true,
+    "specific_CPs_shared_across_heads": true,
+    "std_for_CPs": 0.02,
+
+    "num_epochs_list": [2, 5, 5, 5, 5, 5],
+    "optimizer_name": ["AdamW", "AdamW", "AdamW", "AdamW", "AdamW", "AdamW"],
+    "lr_default": [1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3],
+    "lr_calibration_coefficients": [1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3],
+    "lr_power_norm": [2e-4, 2e-4, 2e-4, 2e-4, 2e-4, 2e-4],
+    "lr_PEFT_vision_shared": [1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3],
+    "lr_PEFT_vision_specific": [1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3],
+    "lr_PEFT_text_shared": [1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3],
+    "lr_PEFT_text_specific": [1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3],
+    "lr_classifier": [1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3],
+    "lr_embeddings_biases": [1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3],
+    "weight_decay": [2e-5, 2e-5, 2e-5, 2e-5, 2e-5, 2e-5],
+    "weight_decay_classifiers": [2e-5, 2e-5, 2e-5, 2e-5, 2e-5, 2e-5],
+
+    "calibrate_vision_prototypes": true,
+    "use_prototype_correction": true,
+
+    "batch_size_limit_for_incremental_tasks": 400,
+    "chunk_size_vision": 64,
+    "chunk_size_text": 64,
+
+    "coef_synonyms_prototypes_init_value": 0.5,
+    "coef_visual_prototypes_calibration_init_value": 0.5,
+    "coef_inter_modal_calibration_init_value": 0.5,
+    "coef_shift_text_from_current_domain_in_vision_modality_init_value": 0.3,
+    "coef_shift_text_from_first_domain_in_vision_modality_init_value": 0.5,
+    "coef_shift_text_init_value": 0.3,
+    "coef_shift_vision_from_first_domain_init_value": 0.5,
+    "coef_shift_vision_from_current_domain_init_value": 0.25,
+    "power_norm_alpha_vision_init_value": 0.8,
+    "power_norm_alpha_text_init_value": 0.8,
+
+    "classifier_type": "ClassifierType.Cosine",
+    "use_temporary_classifier": true,
+    "init_temperature_cosine_classifier": 0.07,
+    "init_temperature_stochastic_classifier": 16.0,
+
+    "minimum_num_samples_required_for_statistics_in_incremental_tasks": 100,
+    "minimum_num_samples_per_class_required_for_domain_id_prediction": 10,
+
+    "separate_or_shared_covariance_for_domain_id": false,
+    
+    "chosen_layer_vision": 12,
+    "task_shared_layers": [0, 1, 2, 3, 4, 5, 6, 7],
+    "task_specific_layers": [8, 9, 10, 11],
+
+    "use_LSR": [true, false, false, false, false, false],
+    "LSR_generated_classes_labels": "LSR_GeneratedClassesLabels.InterpolatedLogits",
+    "num_pseudo_embeddings": 10,
+    "LSR_num_candidates": 300,
+    "LSR_num_ways_after_filtering_1": 24,
+    "LSR_num_ways_after_filtering_2": 12,
+    "LSR_beta": 1.0,
+    "LSR_distributions_domain": "LSR_Distributions_Domain.Current",
+    
+    "CLIP_templates": [
+        "{class_name} .."
+    ],
+    "num_synonyms_limit": 10,
+    
+    "ignore_domain": false,
+    
+    "embd_dim": 768,
+    "seeds_list": [1, 2, 3],
+    "gpu_id": 0,
+    "use_cache": false,
+    "debugging": false
+}
