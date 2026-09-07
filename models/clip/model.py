@@ -112,7 +112,7 @@ class Transformer(nn.Module):
         LoRAs_dict: dict = None,
         prompts_dict: dict = None
     ):
-        
+        # x.shape: [seq_length, batch_size, dim_embed]
         if chosen_layer == -1:
             chosen_layer = self.layers
         else:
@@ -120,8 +120,8 @@ class Transformer(nn.Module):
         
         for layer_number in range(chosen_layer):
             if coalescent_projections_dict is not None:
-                CPs_QK = coalescent_projections_dict[f"QK,{layer_number}"]
-                CPs_SV = coalescent_projections_dict[f"SV,{layer_number}"]
+                CPs_QK = coalescent_projections_dict.get(f"QK,{layer_number}")
+                CPs_SV = coalescent_projections_dict.get(f"SV,{layer_number}")
             else:
                 CPs_QK = None
                 CPs_SV = None

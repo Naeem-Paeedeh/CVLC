@@ -37,15 +37,6 @@ class ClassifierType(Enum):
     Cosine = 2
     Stochastic = 3
     
-
-class LSR_Distributions_Domain(Enum):
-    Base = 1
-    Current = 2
-    
-class LSR_GeneratedClassesLabels(Enum):
-    NewLabels = 1
-    InterpolatedLogits = 2
-    
     
 class InitializationApproachForIncrementalTasks(Enum):
     Reinitialize = 1
@@ -58,3 +49,8 @@ class PEFT_Type(Enum):
     CoalescentProjection = 1
     LoRA = 2
     Prompt = 3
+
+
+class CoalescentProjectionType(Enum):
+    CP = 1
+    DCP = 2

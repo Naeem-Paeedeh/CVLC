@@ -38,7 +38,28 @@ class Statistics(nn.Module):
         self.shared_covariances_inverse = torch.tensor([], device=device)     # Its shape would be [embed_dim, embed_dim]
         
         self.separated_covariances = torch.tensor([], device=device)  # Its shape: [num_encountered_tasks, embed_dim, embed_dim]
-        self.separate_covariances_inverse = torch.tensor([], device=device)  # Its shape: [num_encountered_tasks, embed_dim, 
+        self.separate_covariances_inverse = torch.tensor([], device=device)  # Its shape: [num_encountered_tasks, embed_dim, embed_dim]
+    
+    def move_to_device_(self, device):
+        self.device = device
+        for name in (
+            "means",
+            "labels",
+            "domain_ids",
+            "accumulated_shared_covariances",
+            "shared_covariances_inverse",
+            "separated_covariances",
+            "separate_covariances_inverse",
+        ):
+            tensor = getattr(self, name, None)
+            if tensor is not None:
+                setattr(self, name, tensor.to(device))
+    
+    @staticmethod
+    def _append(existing: T, new: T) -> T:
+        if existing.numel() == 0:
+            return new
+        return torch.cat([existing, new], dim=0)
         
     def update(
         self,
@@ -57,21 +78,21 @@ class Statistics(nn.Module):
         """
         assert len(means) == len(labels)
         
-        covariances = covariances.detach().to(self.device)
         means = means.detach().to(self.device)
         labels = labels.detach().to(self.device)
         
         self.task_count += 1
         assert domain_id == self.task_count - 1
         
-        self.means = torch.cat([self.means, means], dim=0)
-        self.labels = torch.cat([self.labels, labels], dim=0)
-        self.domain_ids = torch.cat([self.domain_ids, domain_id * torch.ones_like(labels)], dim=0)
+        self.means = self._append(self.means, means)
+        self.labels = self._append(self.labels, labels)
+        self.domain_ids = self._append(self.domain_ids, domain_id * torch.ones_like(labels))
         
         if covariances is not None:
+            covariances = covariances.detach().to(self.device)
             # In this case, we accumulate the covariances.
-            if self.accumulated_shared_covariances.dim() == 1:      # For the first time, we don't have a matrix for summation.
-                self.accumulated_shared_covariances = torch.cat([self.separated_covariances, covariances], dim=0)
+            if self.accumulated_shared_covariances.numel() == 0:      # For the first time, we don't have a matrix for summation.
+                self.accumulated_shared_covariances = covariances
             elif self.accumulate_shared_covariances_from_all_domains:
                 self.accumulated_shared_covariances = self.accumulated_shared_covariances + covariances
             
@@ -79,9 +100,9 @@ class Statistics(nn.Module):
                 cov_inv_temp = torch.linalg.pinv(self.accumulated_shared_covariances / self.task_count, hermitian=True)
                 self.shared_covariances_inverse = cov_inv_temp.to(self.device)
             
-            self.separated_covariances = torch.cat([self.separated_covariances, covariances], dim=0)
+            self.separated_covariances = self._append(self.separated_covariances, covariances)
             cov_inv_temp = torch.linalg.pinv(covariances, hermitian=True)
-            self.separate_covariances_inverse = torch.cat([self.separate_covariances_inverse, cov_inv_temp], dim=0)
+            self.separate_covariances_inverse = self._append(self.separate_covariances_inverse, cov_inv_temp)
             
     def obtain_statistics(
         self,
@@ -221,6 +242,7 @@ class CoalescentProjections(nn.Module):
         self,
         enable_vision_CPs: bool,
         enable_text_CPs: bool,
+        enable_CPs_SV: bool,
         num_heads_vision: int,
         num_heads_text: int,
         dim_head_vision: int,
@@ -239,6 +261,8 @@ class CoalescentProjections(nn.Module):
         
         self.enable_vision_CPs = enable_vision_CPs
         self.enable_text_CPs = enable_text_CPs
+        # DCP applies a second matrix after the Value projection; CP uses the QK matrix only.
+        self.enable_CPs_SV = enable_CPs_SV
         
         self.dim_head_vision = dim_head_vision
         self.dim_head_text = dim_head_text
@@ -281,12 +305,13 @@ class CoalescentProjections(nn.Module):
                     **arguments_dict
                 )
                 # Between the Softmax(Attn) and Value
-                self.CPs_shared_vision_dict[f'SV,layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
-                    num_heads=self.num_heads_vision,
-                    dim_head=self.dim_head_vision,
-                    shared_across_heads=self.shared_CPS_shared_across_heads,
-                    **arguments_dict
-                )
+                if self.enable_CPs_SV:
+                    self.CPs_shared_vision_dict[f'SV,layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
+                        num_heads=self.num_heads_vision,
+                        dim_head=self.dim_head_vision,
+                        shared_across_heads=self.shared_CPS_shared_across_heads,
+                        **arguments_dict
+                    )
             
             if self.enable_text_CPs:
                 self.CPs_shared_text_dict[f'QK,layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
@@ -295,11 +320,12 @@ class CoalescentProjections(nn.Module):
                     shared_across_heads=self.shared_CPS_shared_across_heads,
                     **arguments_dict
                 )
-                self.CPs_shared_text_dict[f'SV,layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
-                    num_heads=self.num_heads_text,
-                    dim_head=self.dim_head_text,
-                    shared_across_heads=self.shared_CPS_shared_across_heads,
-                    **arguments_dict
+                if self.enable_CPs_SV:
+                    self.CPs_shared_text_dict[f'SV,layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
+                        num_heads=self.num_heads_text,
+                        dim_head=self.dim_head_text,
+                        shared_across_heads=self.shared_CPS_shared_across_heads,
+                        **arguments_dict
                     )
             
     def prepare_for_a_new_task(
@@ -324,12 +350,13 @@ class CoalescentProjections(nn.Module):
                         shared_across_heads=self.specific_CPS_shared_across_heads,
                         **arguments_dict
                     )
-                    self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
-                        num_heads=self.num_heads_vision,
-                        dim_head=self.dim_head_vision,
-                        shared_across_heads=self.specific_CPS_shared_across_heads,
-                        **arguments_dict
-                    )
+                    if self.enable_CPs_SV:
+                        self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
+                            num_heads=self.num_heads_vision,
+                            dim_head=self.dim_head_vision,
+                            shared_across_heads=self.specific_CPS_shared_across_heads,
+                            **arguments_dict
+                        )
                 if self.enable_text_CPs:
                     self.CPs_specific_text_dict[f'QK,domain={domain_id},layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
                         num_heads=self.num_heads_text,
@@ -337,12 +364,13 @@ class CoalescentProjections(nn.Module):
                         shared_across_heads=self.specific_CPS_shared_across_heads,
                         **arguments_dict
                     )
-                    self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
-                        num_heads=self.num_heads_text,
-                        dim_head=self.dim_head_text,
-                        shared_across_heads=self.specific_CPS_shared_across_heads,
-                        **arguments_dict
-                    )
+                    if self.enable_CPs_SV:
+                        self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}'] = initialize_a_coalescent_projection_tensor(
+                            num_heads=self.num_heads_text,
+                            dim_head=self.dim_head_text,
+                            shared_across_heads=self.specific_CPS_shared_across_heads,
+                            **arguments_dict
+                        )
             elif self.peft_for_new_domain in [nt.InitializationApproachForIncrementalTasks.CopyFromPreviousDomain, nt.InitializationApproachForIncrementalTasks.CopyFromFirstDomain]:       # In the incremental tasks, we copy the domain-specific CPs from previous domain and freeze the previous domain-specific CPs
                 # Vision
                 if self.peft_for_new_domain == nt.InitializationApproachForIncrementalTasks.CopyFromFirstDomain:
@@ -366,14 +394,14 @@ class CoalescentProjections(nn.Module):
     ):
         if self.enable_vision_CPs:
             self.CPs_specific_vision_dict[f'QK,domain={domain_id},layer_number={layer_number}'] = deepcopy(self.CPs_specific_vision_dict[f'QK,domain={domain_to_copy_from},layer_number={layer_number}']).requires_grad_(True)
-            
-            self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}'] = deepcopy(self.CPs_specific_vision_dict[f'SV,domain={domain_to_copy_from},layer_number={layer_number}']).requires_grad_(True)
+            if self.enable_CPs_SV:
+                self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}'] = deepcopy(self.CPs_specific_vision_dict[f'SV,domain={domain_to_copy_from},layer_number={layer_number}']).requires_grad_(True)
             
         # Text
         if self.enable_text_CPs:
             self.CPs_specific_text_dict[f'QK,domain={domain_id},layer_number={layer_number}'] = deepcopy(self.CPs_specific_text_dict[f'QK,domain={domain_to_copy_from},layer_number={layer_number}']).requires_grad_(True)
-            
-            self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}'] = deepcopy(self.CPs_specific_text_dict[f'SV,domain={domain_to_copy_from},layer_number={layer_number}']).requires_grad_(True)
+            if self.enable_CPs_SV:
+                self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}'] = deepcopy(self.CPs_specific_text_dict[f'SV,domain={domain_to_copy_from},layer_number={layer_number}']).requires_grad_(True)
     
     def freeze_CPs_from_a_domain(
         self,
@@ -383,16 +411,16 @@ class CoalescentProjections(nn.Module):
         if self.enable_vision_CPs:
             self.CPs_specific_vision_dict[f'QK,domain={domain_id},layer_number={layer_number}'].requires_grad_(False)
             self.CPs_specific_vision_dict[f'QK,domain={domain_id},layer_number={layer_number}'].grad = None
-            
-            self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}'].requires_grad_(False)
-            self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}'].grad = None
+            if self.enable_CPs_SV:
+                self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}'].requires_grad_(False)
+                self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}'].grad = None
         
         if self.enable_text_CPs:
             self.CPs_specific_text_dict[f'QK,domain={domain_id},layer_number={layer_number}'].requires_grad_(False)
             self.CPs_specific_text_dict[f'QK,domain={domain_id},layer_number={layer_number}'].grad = None
-            
-            self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}'].requires_grad_(False)
-            self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}'].grad = None
+            if self.enable_CPs_SV:
+                self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}'].requires_grad_(False)
+                self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}'].grad = None
             
     def obtain_CPs_of_a_domain(
         self,
@@ -407,20 +435,24 @@ class CoalescentProjections(nn.Module):
         for layer_number in self.task_shared_layers:
             if modality == "vision" and self.enable_vision_CPs:
                 coalescent_projections_current_domain_dict[f"QK,{layer_number}"] = self.CPs_shared_vision_dict[f'QK,layer_number={layer_number}']
-                coalescent_projections_current_domain_dict[f"SV,{layer_number}"] = self.CPs_shared_vision_dict[f'SV,layer_number={layer_number}']
+                if self.enable_CPs_SV:
+                    coalescent_projections_current_domain_dict[f"SV,{layer_number}"] = self.CPs_shared_vision_dict[f'SV,layer_number={layer_number}']
             
             if modality == "text" and self.enable_text_CPs:
                 coalescent_projections_current_domain_dict[f"QK,{layer_number}"] = self.CPs_shared_text_dict[f'QK,layer_number={layer_number}']
-                coalescent_projections_current_domain_dict[f"SV,{layer_number}"] = self.CPs_shared_text_dict[f'SV,layer_number={layer_number}']
+                if self.enable_CPs_SV:
+                    coalescent_projections_current_domain_dict[f"SV,{layer_number}"] = self.CPs_shared_text_dict[f'SV,layer_number={layer_number}']
         
         for layer_number in self.task_specific_layers:
             if modality == "vision" and self.enable_vision_CPs:
                 coalescent_projections_current_domain_dict[f"QK,{layer_number}"] = self.CPs_specific_vision_dict[f'QK,domain={domain_id},layer_number={layer_number}']
-                coalescent_projections_current_domain_dict[f"SV,{layer_number}"] = self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}']
+                if self.enable_CPs_SV:
+                    coalescent_projections_current_domain_dict[f"SV,{layer_number}"] = self.CPs_specific_vision_dict[f'SV,domain={domain_id},layer_number={layer_number}']
             
             if modality == "text" and self.enable_text_CPs:
                 coalescent_projections_current_domain_dict[f"QK,{layer_number}"] = self.CPs_specific_text_dict[f'QK,domain={domain_id},layer_number={layer_number}']
-                coalescent_projections_current_domain_dict[f"SV,{layer_number}"] = self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}']
+                if self.enable_CPs_SV:
+                    coalescent_projections_current_domain_dict[f"SV,{layer_number}"] = self.CPs_specific_text_dict[f'SV,domain={domain_id},layer_number={layer_number}']
             
         return coalescent_projections_current_domain_dict
 
@@ -906,11 +938,13 @@ class Classifiers(nn.Module):
                 pass        # We initialized them at the beginning.
             elif self.peft_for_new_domain == nt.InitializationApproachForIncrementalTasks.CopyFromPreviousDomain:
                 if domain_id > 0:
-                    self.temporary_classifiers[domain_id] = deepcopy(self.temporary_classifiers[domain_id - 1])
+                    # deepcopy also copies requires_grad=False from a frozen source.
+                    self.temporary_classifiers[domain_id] = deepcopy(self.temporary_classifiers[domain_id - 1]).requires_grad_(True)
                     self.temporary_classifiers[domain_id].zero_grad()
             elif self.peft_for_new_domain == nt.InitializationApproachForIncrementalTasks.CopyFromFirstDomain:
                 if domain_id > 0:
-                    self.temporary_classifiers[domain_id] = deepcopy(self.temporary_classifiers[0])
+                    # Domain 0 is frozen after domain 1; later copies must be re-enabled.
+                    self.temporary_classifiers[domain_id] = deepcopy(self.temporary_classifiers[0]).requires_grad_(True)
                     self.temporary_classifiers[domain_id].zero_grad()
             elif self.peft_for_new_domain == nt.InitializationApproachForIncrementalTasks.MeanOfEncounteredDomains:
                 if domain_id > 0:
@@ -1011,6 +1045,7 @@ class Classifiers(nn.Module):
         coef_inter_modal_calibration: float | nn.Parameter | T,
         coef_visual_prototypes_calibration: float | nn.Parameter | T,
         calibrate_vision_prototypes: bool,
+        use_inter_modal_calibration: bool,
         domain_id: int,
         normalize: bool = True,
     ):
@@ -1036,11 +1071,14 @@ class Classifiers(nn.Module):
             embeddings_vision = F.normalize(embeddings_vision, p=2, dim=-1)
             prototypes_vision_calibrated = F.normalize(prototypes_vision_calibrated, p=2, dim=-1)
         
-        prototypes_calibrated = ou.interpolate(
-            coef=coef_inter_modal_calibration,
-            a=prototypes_vision_calibrated,
-            b=prototypes_text
-        )
+        if use_inter_modal_calibration:
+            prototypes_calibrated = ou.interpolate(
+                coef=coef_inter_modal_calibration,
+                a=prototypes_vision_calibrated,
+                b=prototypes_text
+            )
+        else:
+            prototypes_calibrated = prototypes_vision_calibrated
         
         logits_fused = F.linear(embeddings_vision, prototypes_calibrated)
         
@@ -1055,6 +1093,7 @@ class Classifiers(nn.Module):
         coef_inter_modal_calibration: float | nn.Parameter | T,
         coef_visual_prototypes_calibration: float | nn.Parameter | T,
         calibrate_vision_prototypes: bool,
+        use_inter_modal_calibration: bool,
         domain_id: int,     # If we set it to -1, we will use the prototypes of all domains
         normalize: bool = True
     ):
@@ -1079,11 +1118,14 @@ class Classifiers(nn.Module):
             embeddings_vision = F.normalize(embeddings_vision, p=2, dim=-1)
             prototypes_vision_calibrated = F.normalize(prototypes_vision_calibrated, p=2, dim=-1)
             
-        prototypes_calibrated = ou.interpolate(
-            coef=coef_inter_modal_calibration,
-            a=prototypes_vision_calibrated,
-            b=prototypes_text
-        )
+        if use_inter_modal_calibration:
+            prototypes_calibrated = ou.interpolate(
+                coef=coef_inter_modal_calibration,
+                a=prototypes_vision_calibrated,
+                b=prototypes_text
+            )
+        else:
+            prototypes_calibrated = prototypes_vision_calibrated
         
         logits_fused = F.linear(embeddings_vision, prototypes_calibrated)
         
@@ -1099,6 +1141,7 @@ class Classifiers(nn.Module):
         coef_inter_modal_calibration: float | nn.Parameter | T,
         coef_visual_prototypes_calibration: float | nn.Parameter | T,
         calibrate_vision_prototypes: bool,
+        use_inter_modal_calibration: bool,
         domain_id: int,     # If we set it to -1, we will use the prototypes of all domains
         normalize: bool = True
     ):
@@ -1128,11 +1171,14 @@ class Classifiers(nn.Module):
             
         correspondin_text_prototypes = prototypes_text[labels_predicted % self.num_classes]
             
-        embeddings_calibrated = ou.interpolate(
-            coef=coef_inter_modal_calibration,
-            a=embeddings_vision_calibrated,
-            b=correspondin_text_prototypes
-        )
+        if use_inter_modal_calibration:
+            embeddings_calibrated = ou.interpolate(
+                coef=coef_inter_modal_calibration,
+                a=embeddings_vision_calibrated,
+                b=correspondin_text_prototypes
+            )
+        else:
+            embeddings_calibrated = embeddings_vision_calibrated
         
         return embeddings_calibrated
 

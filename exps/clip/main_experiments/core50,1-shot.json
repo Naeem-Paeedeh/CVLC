@@ -1,11 +1,11 @@
 {
-    "experiment_description": "LoRA",
-    "prefix": "ablation,LoRA",
+    "experiment_description": "CVLC",
+    "prefix": "CVLC",
     "dataset_name": "core50",
     "data_path": "/newEra/shared/Datasets/DIL/core50_128x128",
     "total_sessions" : 8,
     "order": 0,
-    "num_shots": 2,
+    "num_shots": 1,
     "shuffle": true,
     "backbone_type": "BackboneType.CLIP_ViT_B16",
     "batch_size": 64,
@@ -14,24 +14,17 @@
     "prototype_calculation_mode_text": "PrototypeTextModality.WeightedSynonyms",
     "max_num_descriptions": 10,
     
-    "parameter_efficient_method": "PEFT_Type.LoRA",
-    "LoRA_rank_vision": 3,
-    "LoRA_rank_text": 4,
-    "LoRA_QKV_mask": [true, false, true],
-    
-    "enable_vision_CPs": false,
-    "enable_text_CPs": false,
-    "enable_vision_LoRAs": true,
-    "enable_text_LoRAs": true,
-    "enable_vision_prompts": false,
-    "enable_text_prompts": false,
-    
     "peft_for_new_domain": "InitializationApproachForIncrementalTasks.CopyFromFirstDomain",
 
     "MA_loss_capacity": 50,
     "MA_loss_threshold_for_early_stopping": 0.0,
     
     "use_checkpinting": false,
+
+    "enable_vision_CPs": true,
+    "enable_text_CPs": true,
+    "shared_CPs_shared_across_heads": true,
+    "specific_CPs_shared_across_heads": true,
 
     "num_epochs_list": [4, 8, 8, 8, 8, 8, 8, 8],
     "optimizer_name": ["AdamW", "AdamW", "AdamW", "AdamW", "AdamW", "AdamW", "AdamW", "AdamW"],
@@ -77,8 +70,6 @@
     "separate_or_shared_covariance_for_domain_id": false,
     
     "chosen_layer_vision": 12,
-    "shared_CPs_shared_across_heads": true,
-    "specific_CPs_shared_across_heads": true,
     "task_shared_layers": [0, 1, 2, 3, 4, 5, 6, 7],
     "task_specific_layers": [8, 9, 10, 11],
 
@@ -91,7 +82,7 @@
     "num_synonyms_limit": 10,
     
     "ignore_domain": false,
-    
+
     "embd_dim": 768,
     "seeds_list": [0, 1, 2],
     "gpu_id": 0,

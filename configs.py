@@ -65,6 +65,9 @@ class Configuration:
         
         self.core50_split_seed: int = 1993
         self.core50_test_fraction = 0.2
+        # Official CORe50 NI: train on 8 sessions, evaluate on held-out s3, s7, s10.
+        self.core50_use_official_ni: bool = False
+        self.report_FA_star: bool = True
         
         self.classifier_type: nt.ClassifierType = nt.ClassifierType.Cosine
         
@@ -98,6 +101,7 @@ class Configuration:
         self.task_specific_layers: list[int] = [6, 7, 8, 9, 10, 11]
         self.enable_vision_CPs: bool = True
         self.enable_text_CPs: bool = True
+        self.coalescent_projection_type: nt.CoalescentProjectionType = nt.CoalescentProjectionType.DCP
         
         # LoRA
         self.enable_vision_LoRAs: bool = False
@@ -130,6 +134,9 @@ class Configuration:
         self.power_norm_alpha_text_init_value: float = 1.0
         
         self.calibrate_vision_prototypes: bool = False
+        self.use_inter_modal_calibration: bool = True
+        self.use_synonyms_interpolation: bool = True
+        self.use_interpolations: bool = True
         
         self.peft_for_new_domain: nt.InitializationApproachForIncrementalTasks = nt.InitializationApproachForIncrementalTasks.CopyFromPreviousDomain
         
@@ -154,17 +161,6 @@ class Configuration:
         self.minimum_num_samples_per_class_required_for_domain_id_prediction = 10
         
         self.separate_or_shared_covariance_for_domain_id: bool = False
-        
-        # Latent-space reservation:
-        self.use_LSR: List[bool] = None
-        self.LSR_generated_classes_labels = nt.LSR_GeneratedClassesLabels.NewLabels
-        self.LSR_num_candidates: int = 100
-        self.LSR_num_ways_after_filtering_1 = 8
-        self.LSR_num_ways_after_filtering_2 = 4
-        self.LSR_beta: float = 1.0
-        self.LSR_distributions_domain = nt.LSR_Distributions_Domain.Current
-        self.LSR_separate_covariances: bool = True
-        self.num_pseudo_embeddings: int = 10
         
         self.backbone_type: nt.BackboneType = nt.BackboneType.CLIP_ViT_B16
         
@@ -196,6 +192,7 @@ class Configuration:
         self.num_synonyms_limit = 10
         self.max_num_descriptions: int = 5
         self.prototype_calculation_mode_text: nt.PrototypeTextModality = nt.PrototypeTextModality.Templates
+        self.use_real_class_names: bool = False
         
         self.use_cache: bool = True
         
@@ -219,7 +216,7 @@ class Configuration:
 
         os.makedirs(self.logs_directory_name, exist_ok=True)
 
-        self.log_file_name = f"{self.logs_directory_name}/DB={self.dataset_name},{self.prefix},Order={self.order},n_shots={self.num_shots},Seed={self.seed_current},{self.parameter_efficient_method},Time={self.date_time_str}"
+        self.log_file_name = f"{self.logs_directory_name}/DB={self.dataset_name},{self.prefix},Order={self.order},n_shots={self.num_shots},{self.parameter_efficient_method},Time={self.date_time_str}"   # ,Seed={self.seed_current}
         
         logging.basicConfig(
             level=logging.INFO,
@@ -356,6 +353,11 @@ class Configuration:
         if not self.enable_text_prompts:
             self.num_text_prompts = 0
         
+        if not self.use_interpolations:
+            self.use_inter_modal_calibration = False
+            self.calibrate_vision_prototypes = False
+            self.use_synonyms_interpolation = False
+        
     def verify_setting(self):
         assert self.init_cls == self.increment      # We may consider other cases in the future.
         
@@ -373,11 +375,6 @@ class Configuration:
         assert self.num_shots >= 0
         
         assert len(self.num_epochs_list) == self.total_sessions
-        
-        if not self.LSR_separate_covariances:
-            raise NotImplementedError()
-        
-        assert self.total_sessions == len(self.use_LSR)
         
         assert self.total_sessions == len(self.lr_default)
         assert self.total_sessions == len(self.lr_calibration_coefficients)
@@ -397,9 +394,14 @@ class Configuration:
             
         if self.parameter_efficient_method == nt.PEFT_Type.CoalescentProjection:
             assert self.enable_vision_CPs or self.enable_text_CPs
+            assert self.coalescent_projection_type in [nt.CoalescentProjectionType.CP, nt.CoalescentProjectionType.DCP]
             
         if self.parameter_efficient_method == nt.PEFT_Type.Prompt:
             assert self.enable_vision_prompts or self.enable_text_prompts
+        
+        if self.core50_use_official_ni:
+            assert self.dataset_name == 'core50', "core50_use_official_ni is only valid for CORe50."
+            self.report_FA_star = False
         
     def save(self, file_path: str):
         # We save args to know what was the setting in the past.

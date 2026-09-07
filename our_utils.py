@@ -13,7 +13,6 @@ import shutil
 import os
 import json
 import math
-from torch.distributions import MultivariateNormal
 
 
 class Identity(nn.Module):
@@ -34,7 +33,6 @@ def get_time_str(add_time: bool = True):
 def set_seed(seed):
     """Sets the seed of random number generators to the predefined seed number for reproducibility.
     """
-    # torch.use_deterministic_algorithms(True)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -43,7 +41,7 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.random.manual_seed(seed)
-    random.seed(seed)
+    # torch.use_deterministic_algorithms(True)
 
 
 def freeze_or_unfreeze(obj: nn.Module, requires_grad: bool):
@@ -430,47 +428,6 @@ def estimated_remaining_time_string(total_time, total_tasks, num_finished_tasks:
     ert = (total_tasks - num_finished_tasks_from_one) * total_time / num_finished_tasks_from_one
     res = "ERT: %s" % Stopwatch.convert_to_hours_minutes(ert)
     return res
-
-
-def sample_from_gaussian(mean: T, covariance: T, num_samples: int, epsilon: float = 1e-3):
-    # mean.shape:       [1, dim_embed]
-    # covariance.shape: [dim_embed, dim_embed]
-    jitter = epsilon * torch.eye(covariance.shape[0], device=mean.device)     # for the non-positive-definite case
-    mvn = MultivariateNormal(mean, covariance_matrix=covariance + jitter)
-    
-    return mvn.rsample((num_samples,))
-
-
-@torch.no_grad()
-def kl_divergence_fast(base_means, base_covs, cand_means, cand_covs, eps=1e-3):
-    """
-    base_means:  [L, d]
-    base_covs:   [L, d, d]
-    cand_means:  [M, d]
-    cand_covs:   [M, d, d]
-    Returns:     [M] (sum of KL over base classes for each candidate)
-    """
-    d = base_means.shape[-1]
-    identity_scaled = eps * torch.eye(d, device=base_means.device)
-
-    # Precompute inverses and log-dets for candidates
-    cand_covs_reg = cand_covs + identity_scaled
-    cand_inv = torch.linalg.inv(cand_covs_reg)             # [M, d, d]
-    cand_logdet = torch.linalg.slogdet(cand_covs_reg)[1]   # [M]
-
-    base_covs_reg = base_covs + identity_scaled
-    base_logdet = torch.linalg.slogdet(base_covs_reg)[1]   # [L]
-
-    trace = torch.einsum('mij,lji->lm', cand_inv, base_covs_reg)
-
-    diff = base_means.unsqueeze(1) - cand_means.unsqueeze(0)  # [L, M, d]
-    mahal = torch.einsum('lmd,mde,lme->lm', diff, cand_inv, diff)
-
-    # log-det ratio
-    ratio = cand_logdet.unsqueeze(0) - base_logdet.unsqueeze(1)  # [L, M]
-
-    kl = 0.5 * (ratio - d + trace + mahal)  # [L, M]
-    return kl.sum(dim=0)  # [M]
 
 
 class MovingAverageDict:

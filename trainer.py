@@ -49,26 +49,31 @@ def train_with_different_seeds(cfg: Configuration):
             
             mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(AA_star_without_oracle_list)
             logging.info(f"AA* mean (w/o Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
-            mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(FA_star_without_oracle_list)
-            logging.info(f"FA* mean (w/o Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
+            if cfg.report_FA_star:
+                mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(FA_star_without_oracle_list)
+                logging.info(f"FA* mean (w/o Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
             
-            mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(AA_star_with_oracle_list)
-            logging.info(f"AA* mean (with Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
-            mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(FA_star_with_oracle_list)
-            logging.info(f"FA* mean (with Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
-            
-            mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(domain_classification_accuracy_list)
-            logging.info(f"Mean (Domain Classification): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
+            if not cfg.core50_use_official_ni:
+                mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(AA_star_with_oracle_list)
+                logging.info(f"AA* mean (with Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
+                if cfg.report_FA_star:
+                    mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(FA_star_with_oracle_list)
+                    logging.info(f"FA* mean (with Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
+                
+                mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(domain_classification_accuracy_list)
+                logging.info(f"Mean (Domain Classification): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
             
             mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(mean_accuracies_without_oracle_list)
             logging.info(f"Acc., mean (w/o Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
-            mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(mean_accuracies_with_oracle_list)
-            logging.info(f"Acc., mean (with Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
+            if not cfg.core50_use_official_ni:
+                mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(mean_accuracies_with_oracle_list)
+                logging.info(f"Acc., mean (with Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
             
             mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(last_accuracies_without_oracle_list)
             logging.info(f"Acc., last (w/o Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
-            mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(last_accuracies_with_oracle_list)
-            logging.info(f"Acc., last (with Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
+            if not cfg.core50_use_official_ni:
+                mean_for_all_random_seeds, std_for_all_random_seeds = ou.calculate_mean_and_std_for_a_list(last_accuracies_with_oracle_list)
+                logging.info(f"Acc., last (with Oracle): {mean_for_all_random_seeds:.2f} ± {std_for_all_random_seeds:.2f}")
 
 
 def train_with_the_chosen_random_seed(cfg: Configuration):
@@ -107,7 +112,7 @@ def train_with_the_chosen_random_seed(cfg: Configuration):
         slf.prepare_for_current_domain()
         
         if cfg.num_shots == 0:
-            raise NotImplementedError()
+            logging.info("Zero-shot CLIP evaluation: skipping training.")
         elif cfg.num_shots > 0:
             slf.train()
             
@@ -116,44 +121,62 @@ def train_with_the_chosen_random_seed(cfg: Configuration):
         domain_classification_accuracy = 0.0
         
         if cfg.num_shots == 0:
-            raise NotImplementedError()
+            acc_without_oracle, acc_with_oracle, acc_per_domain_without_oracle, acc_per_domain_with_oracle, domain_classification_accuracy = slf.evaluate_zero_shot_clip()
+            
+            if not cfg.core50_use_official_ni:
+                accuracies_matrix_without_oracle[domain_id, :domain_id + 1] = acc_per_domain_without_oracle
+                accuracies_matrix_with_oracle[domain_id, :domain_id + 1] = acc_per_domain_with_oracle
         else:
             acc_without_oracle, acc_with_oracle, acc_per_domain_without_oracle, acc_per_domain_with_oracle, domain_classification_accuracy = slf.evaluate_on_test_set()
             
-            accuracies_matrix_without_oracle[domain_id, :domain_id + 1] = acc_per_domain_without_oracle
-            accuracies_matrix_with_oracle[domain_id, :domain_id + 1] = acc_per_domain_with_oracle
+            if not cfg.core50_use_official_ni:
+                accuracies_matrix_without_oracle[domain_id, :domain_id + 1] = acc_per_domain_without_oracle
+                accuracies_matrix_with_oracle[domain_id, :domain_id + 1] = acc_per_domain_with_oracle
         
-        logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, Acc. (w/o oracle): {acc_without_oracle:.2f}, AA (with oracle): {acc_with_oracle:.2f}")
+        if cfg.core50_use_official_ni:
+            logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, Acc. (official NI test s3/s7/s10): {acc_without_oracle:.2f}")
+        else:
+            logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, Acc. (w/o oracle): {acc_without_oracle:.2f}, AA (with oracle): {acc_with_oracle:.2f}")
         
         acc_per_domain, _, _ = ou.get_printable_string_from_a_list_of_float_numbers_with_two_digits(acc_per_domain_without_oracle.tolist())
         
         AA_without_oracle = acc_per_domain_without_oracle.mean().item()
         
-        logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, Acc. per domain (w/o oracle): {acc_per_domain}, AA (w/o oracle): {AA_without_oracle:.2f}")
-        
-        acc_per_domain, _, _ = ou.get_printable_string_from_a_list_of_float_numbers_with_two_digits(acc_per_domain_with_oracle.tolist())
-        
-        AA_with_oracle = acc_per_domain_with_oracle.mean().item()
-        
-        logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, Acc. per domain (with oracle): {acc_per_domain}, AA (with oracle): {AA_with_oracle:.2f}")
-        
-        overall_average_accuracy_without_oracle, overall_forgetting_alleviation_without_oracle = calculate_average_accuracy_and_forgetting_alleviation(
-            accuracies_matrix=accuracies_matrix_without_oracle,
-            current_domain_id=cfg.current_domain_id
-        )
-        
-        logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, AA* (w/o oracle): {overall_average_accuracy_without_oracle:.2f}, FA*: {overall_forgetting_alleviation_without_oracle:.2f}")
-        
-        overall_average_accuracy_with_oracle, overall_forgetting_alleviation_with_oracle = calculate_average_accuracy_and_forgetting_alleviation(
-            accuracies_matrix=accuracies_matrix_with_oracle,
-            current_domain_id=cfg.current_domain_id
-        )
-        
-        logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, AA* (with oracle): {overall_average_accuracy_with_oracle:.2f}, FA*: {overall_forgetting_alleviation_with_oracle:.2f}")
+        if cfg.core50_use_official_ni:
+            logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, Acc. per test session (s3, s7, s10): {acc_per_domain}, AA (w/o oracle): {AA_without_oracle:.2f}")
+        else:
+            logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, Acc. per domain (w/o oracle): {acc_per_domain}, AA (w/o oracle): {AA_without_oracle:.2f}")
+            
+            acc_per_domain, _, _ = ou.get_printable_string_from_a_list_of_float_numbers_with_two_digits(acc_per_domain_with_oracle.tolist())
+            
+            AA_with_oracle = acc_per_domain_with_oracle.mean().item()
+            
+            logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, Acc. per domain (with oracle): {acc_per_domain}, AA (with oracle): {AA_with_oracle:.2f}")
         
         accuracies_without_oracle_list.append(acc_without_oracle)
         accuracies_with_oracle_list.append(acc_with_oracle)
         domain_classification_accuracy_list.append(domain_classification_accuracy)
+        
+        if cfg.core50_use_official_ni:
+            overall_average_accuracy_without_oracle = float(sum(accuracies_without_oracle_list) / len(accuracies_without_oracle_list))
+            overall_forgetting_alleviation_without_oracle = 0.0
+            overall_average_accuracy_with_oracle = overall_average_accuracy_without_oracle
+            overall_forgetting_alleviation_with_oracle = 0.0
+            logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, AA* (w/o oracle): {overall_average_accuracy_without_oracle:.2f}")
+        else:
+            overall_average_accuracy_without_oracle, overall_forgetting_alleviation_without_oracle = calculate_average_accuracy_and_forgetting_alleviation(
+                accuracies_matrix=accuracies_matrix_without_oracle,
+                current_domain_id=cfg.current_domain_id
+            )
+            
+            logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, AA* (w/o oracle): {overall_average_accuracy_without_oracle:.2f}, FA*: {overall_forgetting_alleviation_without_oracle:.2f}")
+            
+            overall_average_accuracy_with_oracle, overall_forgetting_alleviation_with_oracle = calculate_average_accuracy_and_forgetting_alleviation(
+                accuracies_matrix=accuracies_matrix_with_oracle,
+                current_domain_id=cfg.current_domain_id
+            )
+            
+            logging.info(f"Domain {cfg.current_domain_id + 1}/{cfg.total_sessions}, order: {cfg.order}, seed: {cfg.seed_current}, AA* (with oracle): {overall_average_accuracy_with_oracle:.2f}, FA*: {overall_forgetting_alleviation_with_oracle:.2f}")
         
         mean_accuracies_without_oracle, _ = show_results(
             cfg=cfg,
@@ -161,17 +184,21 @@ def train_with_the_chosen_random_seed(cfg: Configuration):
             description="Accuracies (w/o oracle)"
         )
         
-        mean_accuracies_with_oracle, _ = show_results(
-            cfg=cfg,
-            accuracies_list=accuracies_with_oracle_list, 
-            description="Accuracies (with oracle)"
-        )
-        
-        mean_domain_classification, _ = show_results(
-            cfg=cfg,
-            accuracies_list=domain_classification_accuracy_list, 
-            description="Domain classification accuracies (after each domain)"
-        )
+        if cfg.core50_use_official_ni:
+            mean_accuracies_with_oracle = mean_accuracies_without_oracle
+            mean_domain_classification = 0.0
+        else:
+            mean_accuracies_with_oracle, _ = show_results(
+                cfg=cfg,
+                accuracies_list=accuracies_with_oracle_list, 
+                description="Accuracies (with oracle)"
+            )
+            
+            mean_domain_classification, _ = show_results(
+                cfg=cfg,
+                accuracies_list=domain_classification_accuracy_list, 
+                description="Domain classification accuracies (after each domain)"
+            )
     
     logging.info('This experiment is finished!')
     

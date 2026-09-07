@@ -82,15 +82,6 @@
     "task_shared_layers": [0, 1, 2, 3, 4, 5, 6, 7],
     "task_specific_layers": [8, 9, 10, 11],
 
-    "use_LSR": [true, false, false, false, false, false, false, false],
-    "LSR_generated_classes_labels": "LSR_GeneratedClassesLabels.InterpolatedLogits",
-    "num_pseudo_embeddings": 10,
-    "LSR_num_candidates": 100,
-    "LSR_num_ways_after_filtering_1": 8,
-    "LSR_num_ways_after_filtering_2": 4,
-    "LSR_beta": 1.0,
-    "LSR_distributions_domain": "LSR_Distributions_Domain.Current",
-    
     "CLIP_templates": [
         "{class_name}",
         "{class_name} ..",

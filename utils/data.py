@@ -13,8 +13,20 @@ import csv
 from configs import Configuration
 from torchvision.transforms import InterpolationMode
 from abc import ABC, abstractmethod
+from pathlib import Path
 import our_utils as ou
 import logging
+
+
+CORE50_OFFICIAL_NI_TEST_SESSIONS = ("s3", "s7", "s10")
+
+
+def parse_core50_session_name(path: str) -> str:
+    """Return the session folder name (e.g. 's3') from a CORe50 image path."""
+    for part in Path(path).parts:
+        if len(part) >= 2 and part[0] in ("s", "S") and part[1:].isdigit():
+            return part.lower()
+    raise ValueError(f"Could not parse a CORe50 session name from path: {path}")
 
 
 class iData(object):
@@ -231,6 +243,7 @@ class iCore50(iData):
 
         # 8 sessions are the 8 domains (order is applied inside CORE50)
         self.domain_names = [f"s{i + 1}" for i in range(8)]
+        self.test_session_names = list(CORE50_OFFICIAL_NI_TEST_SESSIONS)
         self.order_list_0based: list = None
 
         self.MANY_SHOT_THRES = 60
@@ -259,6 +272,58 @@ class iCore50(iData):
         
         self.order_list_0based = datagen.order_list_0based
 
+        if getattr(self.cfg, "core50_use_official_ni", False):
+            self._download_official_ni(datagen)
+        else:
+            self._download_with_per_domain_split(datagen)
+        
+    def _download_official_ni(self, datagen: CORE50):
+        """Official NI: train on 8 sessions, test on held-out s3, s7, and s10."""
+        train_x, train_y = [], []
+        train_session_names = []
+
+        for domain_id, batch_idx in enumerate(datagen._train_batches_idx):
+            batch_idx = np.asarray(batch_idx)
+            batch_y = np.asarray(datagen._train_batches_y[domain_id], dtype=np.int32)
+            domain_y = batch_y + domain_id * 50
+            paths = [os.path.join(datagen.root, datagen.paths[idx]) for idx in batch_idx]
+            if len(paths) == 0:
+                raise ValueError(f"Official NI training batch {domain_id} is empty.")
+
+            train_x.extend(paths)
+            train_y.extend(domain_y.tolist())
+            train_session_names.append(parse_core50_session_name(paths[0]))
+
+        test_idx_list = datagen.LUP[datagen.scenario][datagen.run][-1]
+        test_y = np.asarray(datagen.labels[datagen.scenario][datagen.run][-1], dtype=np.int32) % 50
+        test_x = [os.path.join(datagen.root, datagen.paths[idx]) for idx in test_idx_list]
+        found_test_sessions = sorted(
+            {parse_core50_session_name(path) for path in test_x},
+            key=lambda name: int(name[1:]),
+        )
+        if tuple(found_test_sessions) != CORE50_OFFICIAL_NI_TEST_SESSIONS:
+            raise ValueError(
+                "Official NI test sessions must be s3, s7, and s10. "
+                f"Found: {found_test_sessions}"
+            )
+
+        self.domain_names = train_session_names
+        self.test_session_names = list(CORE50_OFFICIAL_NI_TEST_SESSIONS)
+        self.train_data = np.array(train_x)
+        self.train_targets = np.array(train_y, dtype=np.int32)
+        self.test_data = np.array(test_x)
+        self.test_targets = np.array(test_y, dtype=np.int32)
+
+        logging.info(
+            "Official CORe50 NI protocol: train sessions = %s, test sessions = %s, "
+            "train images = %d, test images = %d",
+            self.domain_names,
+            self.test_session_names,
+            len(self.train_data),
+            len(self.test_data),
+        )
+
+    def _download_with_per_domain_split(self, datagen: CORE50):
         # Fixed seed -> identical train/test split across all sessions & runs
         split_seed = self.cfg.seed_current + 1993 #  getattr(self.cfg, "core50_split_seed", 1993)
         rng = np.random.default_rng(split_seed)
@@ -291,6 +356,9 @@ class iCore50(iData):
         self.test_targets  = np.array(test_y, dtype=np.int32)
         
     def get_domain_names(self):
+        if getattr(self.cfg, "core50_use_official_ni", False):
+            # Session names were taken from already-reordered official NI batches.
+            return list(self.domain_names)
         order_list_0based = self.order_list_0based
         domain_names_for_this_order = [self.domain_names[order_list_0based[i]] for i in range(8)]
         return domain_names_for_this_order

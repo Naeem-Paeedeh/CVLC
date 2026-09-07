@@ -36,6 +36,7 @@ class DataManager(object):
         self._class_order: list = []
         
         self.domain_names_for_this_order: list = []
+        self.test_session_names: list = []
         
         self._setup_data(self.dataset_name, shuffle_class_order=shuffle_class_order, seed=seed)
         
@@ -92,6 +93,15 @@ class DataManager(object):
                     transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
                 ])
                 transforms_list.append(transform_clip)
+            elif mode == "clip":
+                # Official CLIP preprocess (ViT-B/16 and ViT-L/14 use 224px).
+                transform_clip = transforms.Compose([
+                    transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+                ])
+                transforms_list.append(transform_clip)
             else:
                 raise ValueError(f"Unknown mode: {mode}.")
 
@@ -104,6 +114,8 @@ class DataManager(object):
             class_data, class_targets = self._select(x, y, low_range=idx, high_range=idx + 1)
             
             # assert int(np.unique(class_targets)[0]) == idx
+            if len(class_data) == 0:
+                continue
             
             if num_shots == -1 or num_shots == 0:     # We use all sample for this class
                 data.append(class_data)
@@ -201,6 +213,7 @@ class DataManager(object):
         self.class_names_real = idata.class_names_real
         self.class_names = idata.class_names.tolist()
         self.domain_names_for_this_order = idata.get_domain_names()
+        self.test_session_names = getattr(idata, "test_session_names", [])
 
         # Data
         self._train_data = idata.train_data

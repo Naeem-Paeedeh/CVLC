@@ -1,28 +1,36 @@
-import os
+import json
 import logging
+import os
+from collections import defaultdict
+from typing import Union
+
+import einops as eo
 import numpy as np
 import torch
-from torch import nn
+from torch import Tensor as T
+from torch import nn, optim
 from torch.nn import functional as F
-from tqdm import tqdm
-from torch import optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, TensorDataset
-from utils.toolkit import tensor2numpy, accuracy_domain_shot
+from tqdm import tqdm
+
+import configs as cg
 import new_types as nt
 import our_utils as ou
-from torch import Tensor as T
-from typing import Any, Union, List, Generator, Tuple, Dict
-from collections import defaultdict
-import json
-import configs as cg
-import einops as eo
-from utils.data_manager import DataManager
-
 from models.clip import clip
 from models.clip.model import CLIP
-from models.other_components import LearnabeCoefficients, CoalescentProjections, LoRAsForCLIP, DeepPrompts, Classifiers, Statistics, CacheManagement
-from models.LSR import LSR
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from models.other_components import (
+    CacheManagement,
+    Classifiers,
+    CoalescentProjections,
+    DeepPrompts,
+    LearnabeCoefficients,
+    LoRAsForCLIP,
+    Statistics,
+)
+from utils.data import CORE50_OFFICIAL_NI_TEST_SESSIONS, parse_core50_session_name
+from utils.data_manager import DataManager
+from utils.toolkit import accuracy_domain_shot, tensor2numpy
 
 
 class CVLC:
@@ -44,6 +52,7 @@ class CVLC:
         
         self.num_classes: int = -1
         self.class_names: list[str] = None
+        self.class_names_real: list[str] = None
         
         if cfg.dataset_name == 'core50':
             self.num_classes = 50
@@ -58,6 +67,7 @@ class CVLC:
         
         self.data_manager: DataManager = None
         self.domain_names_for_this_order: list[str] = []
+        self.test_session_names: list[str] = list(CORE50_OFFICIAL_NI_TEST_SESSIONS)
         self._prepare_data_manager()
         
         self.cfg = cfg
@@ -109,6 +119,13 @@ class CVLC:
             learnable=cfg.lr_calibration_coefficients[cfg.current_domain_id] > 0.0
         ).to(self.device)
         
+        if not cfg.use_inter_modal_calibration:
+            self.calibration_coefficients.coef_inter_modal_calibration.requires_grad_(False)
+        if not cfg.calibrate_vision_prototypes:
+            self.calibration_coefficients.coef_visual_prototypes_calibration.requires_grad_(False)
+        if not cfg.use_synonyms_interpolation:
+            self.calibration_coefficients.coef_synonyms_prototypes.requires_grad_(False)
+        
         self.power_norm_vision_var = nn.Parameter(cfg.power_norm_alpha_vision_init_value * torch.ones(cfg.total_sessions, device=self.device), requires_grad=True)
         self.power_norm_text_var = nn.Parameter(cfg.power_norm_alpha_vision_init_value * torch.ones(cfg.total_sessions, device=self.device), requires_grad=True)
         
@@ -120,6 +137,7 @@ class CVLC:
             self.coalescent_projections = CoalescentProjections(
                 enable_vision_CPs=cfg.enable_vision_CPs,
                 enable_text_CPs=cfg.enable_text_CPs,
+                enable_CPs_SV=cfg.coalescent_projection_type == nt.CoalescentProjectionType.DCP,
                 dim_head_vision=self.dim_embed_vision // self.num_heads_vision,
                 dim_head_text=self.dim_embed_text // self.num_heads_text,
                 num_heads_vision=self.num_heads_vision,
@@ -184,13 +202,7 @@ class CVLC:
             dir_cache=cfg.dir_cache
         )
         
-        self.statistics_from_frozen_backbone = Statistics(embed_dim=self.dim_embed, device=cfg.device)
-        
-        self.lsr = LSR(
-            cfg=cfg,
-            num_classes=self.num_classes,
-            dim_embed=self.dim_embed
-        )
+        self.statistics_from_frozen_backbone = self._make_statistics()
         
     def train(self):
         cfg = self.cfg
@@ -199,19 +211,13 @@ class CVLC:
         
         num_epochs_start = 0
         
-        flag_resumed = False
         num_epochs = cfg.num_epochs_list[cfg.current_domain_id]
         
         if cfg.current_domain_id == 0:
             num_epochs_start = self.try_to_resume()
             
-            flag_resumed = num_epochs_start > 0
-            
             if num_epochs_start > 0:
                 logging.info(f"The training is resumed from epoch: {num_epochs_start}")
-        
-        if not flag_resumed and cfg.use_LSR[cfg.current_domain_id] and num_epochs_start < num_epochs:   # It is required for the LSR
-            self.update_statistics_with_frozen_backbone()
         
         # Computing the prototypes from the old domain.
         if cfg.use_prototype_correction and cfg.current_domain_id > 0:
@@ -278,16 +284,6 @@ class CVLC:
     ):
         cfg = self.cfg
         
-        use_LSR = cfg.use_LSR[cfg.current_domain_id]
-        
-        if use_LSR:
-            iterator_pseudo_embeddings = self.lsr.obtain_pseudo_embedding_generation_iterator(
-                current_domain_id=cfg.current_domain_id,
-                statistics=self.statistics_from_frozen_backbone
-            )
-        else:
-            iterator_pseudo_embeddings = None
-            
         domain_id = cfg.current_domain_id
         
         if ma_loss is None:
@@ -310,8 +306,6 @@ class CVLC:
             logits_fused, labels_final = self.forward_multimodal(
                 images=images,
                 labels=labels,
-                use_LSR=use_LSR,
-                iterator_pseudo_embeddings=iterator_pseudo_embeddings,
                 domain_id=domain_id,
                 normalize=normalize,
                 use_power_norm=use_power_norm,
@@ -343,13 +337,11 @@ class CVLC:
         images: T,
         labels: T,
         domain_id: int,
-        use_LSR: bool,
-        iterator_pseudo_embeddings = None,
         normalize: bool = True,
         use_power_norm: bool = True,
         shift: bool = True,
         calibration: bool = True
-    ) -> Tuple[T, T]:
+    ) -> tuple[T, T]:
         cfg = self.cfg
         
         embeddings_vision = self.forward_vision(
@@ -363,20 +355,6 @@ class CVLC:
         
         labels_without_domain = labels % self.num_classes
         
-        if use_LSR:
-            if cfg.LSR_generated_classes_labels == nt.LSR_GeneratedClassesLabels.NewLabels:
-                num_classes_with_LSR = self.num_classes + cfg.LSR_num_ways_after_filtering_2
-            elif cfg.LSR_generated_classes_labels == nt.LSR_GeneratedClassesLabels.InterpolatedLogits:
-                num_classes_with_LSR = self.num_classes
-            else:
-                raise NotImplementedError()
-            
-            labels_without_domain_one_hot = F.one_hot(labels_without_domain, num_classes=num_classes_with_LSR)
-            embeddings_generated, labels_generated_one_hot = next(iterator_pseudo_embeddings)
-            embeddings_vision = torch.cat([embeddings_vision, embeddings_generated], dim=0)
-            labels_without_domain_one_hot = torch.cat([labels_without_domain_one_hot, labels_generated_one_hot], dim=0)
-            labels_without_domain = labels_without_domain_one_hot
-        
         prototypes_text = self.obtain_final_text_prototypes_for_one_domain(
             use_PEFT=True,
             domain_id=domain_id
@@ -388,6 +366,7 @@ class CVLC:
             coef_inter_modal_calibration=self.calibration_coefficients.coef_inter_modal_calibration[domain_id],
             coef_visual_prototypes_calibration=self.calibration_coefficients.coef_visual_prototypes_calibration[domain_id],
             calibrate_vision_prototypes=cfg.calibrate_vision_prototypes,
+            use_inter_modal_calibration=cfg.use_inter_modal_calibration,
             domain_id=domain_id
         )
             
@@ -431,6 +410,8 @@ class CVLC:
                 self.embeddings_biases_text = data_dict["embeddings_biases_text"]
                 self.prototypes_text = data_dict["prototypes_text"]
                 self.statistics_from_frozen_backbone = data_dict["statistics_from_frozen_backbone"]
+                if hasattr(self.statistics_from_frozen_backbone, "move_to_device_"):
+                    self.statistics_from_frozen_backbone.move_to_device_(torch.device("cpu"))
                 
                 if cfg.parameter_efficient_method == nt.PEFT_Type.CoalescentProjection:
                     self.coalescent_projections = data_dict["coalescent_projections"]
@@ -460,7 +441,7 @@ class CVLC:
         
         if cfg.current_domain_id == 0:
             if update_statistics:
-                self.statistics_from_frozen_backbone = Statistics(embed_dim=self.dim_embed, device=cfg.device)
+                self.statistics_from_frozen_backbone = self._make_statistics()
                 self.update_statistics_with_frozen_backbone()
             
         data_dict = {
@@ -495,6 +476,10 @@ class CVLC:
             domain_id=domain_id,
             parameter_efficient_method=cfg.parameter_efficient_method
         )
+    
+    def _make_statistics(self) -> Statistics:
+        logging.info("Storing statistics on CPU to reduce GPU memory consumption.")
+        return Statistics(embed_dim=self.dim_embed, device=torch.device("cpu"))
             
     @torch.no_grad()
     def _compute_statistics(
@@ -507,9 +492,9 @@ class CVLC:
         shift: bool = False,
         calibration: bool = False,
         coef_regularization: float = 1e-3
-    ) -> Tuple[T, T, T]:
+    ) -> tuple[T, T, T]:
         # Notes:
-        #   1- We use this function in obtain_statistics_for_LSR and update_statistics_for_domain_id_prediction.
+        #   1- We use this function in update_statistics_for_domain_id_prediction.
         #   2- We can only rely on the train set
         cfg = self.cfg
         
@@ -552,13 +537,16 @@ class CVLC:
                 
                 remaining_time_str = ert.calculate(num_finished_tasks=i)
                 ou.print_overwrite(f"{i}/{num_epochs}, {remaining_time_str}")
+        
+        embeddings_all = embeddings_all.cpu()
+        labels_all = labels_all.cpu()
             
-        # 2. We calculate the means and covariances.
-        means_all = torch.tensor([], device=cfg.device)     # means or prototypes
+        # 2. We calculate the means and covariances on CPU.
+        means_all = torch.tensor([], device="cpu")     # means or prototypes
         
         covariances_all: T = None
         if compute_covariances:
-            covariances_all = torch.tensor([], device=cfg.device)
+            covariances_all = torch.tensor([], device="cpu")
         
         assert not cfg.ignore_domain
         labels_unique = labels_all.unique()
@@ -568,20 +556,23 @@ class CVLC:
         
         for i, lbl in enumerate(labels_unique.tolist()):
             mask = labels_all == lbl
-            means = embeddings_all[mask].mean(dim=0, keepdim=True)
+            class_embeddings = embeddings_all[mask]
+            means = class_embeddings.mean(dim=0, keepdim=True)
             
-            means_all = torch.cat([means_all, means.to(self.device)], dim=0)
+            means_all = torch.cat([means_all, means], dim=0)
             
             if compute_covariances:
-                covairances = torch.cov(embeddings_all[mask].T) + coef_regularization * torch.eye(self.dim_embed)
-                covariances_all = torch.cat([covariances_all, covairances.unsqueeze(0).to(self.device)], dim=0)
+                eye = torch.eye(self.dim_embed, device=class_embeddings.device, dtype=class_embeddings.dtype)
+                covairances = torch.cov(class_embeddings.T) + coef_regularization * eye
+                if covariances_all.numel() == 0:
+                    covariances_all = covairances.unsqueeze(0)
+                else:
+                    covariances_all = torch.cat([covariances_all, covairances.unsqueeze(0)], dim=0)
                 
             remaining_time_str = ert.calculate(num_finished_tasks=i)
             ou.print_overwrite(f"{i}/{num_classes}, {remaining_time_str}")
             
         means_all = means_all.to(self.device)
-        if compute_covariances:
-            covariances_all = covariances_all.to(self.device)
         labels_unique = labels_unique.to(self.device)
         
         return means_all, covariances_all, labels_unique
@@ -597,7 +588,7 @@ class CVLC:
         logging.info("Computing the statistics from the frozen backbone ...")
         
         if reset and cfg.current_domain_id == 0:
-            self.statistics_from_frozen_backbone = Statistics(embed_dim=self.dim_embed, device=cfg.device)
+            self.statistics_from_frozen_backbone = self._make_statistics()
             logging.info("The statistics are recalculated.")
         
         means, covariances, labels = self._compute_statistics(
@@ -609,7 +600,7 @@ class CVLC:
             shift=False,
             calibration=False
         )
-            
+        
         self.statistics_from_frozen_backbone.update(
             means=means,
             covariances=covariances,
@@ -642,11 +633,14 @@ class CVLC:
         
         prototypes_text = self.obtain_final_text_prototypes_for_one_domain(domain_id=domain_id)
         
-        embeddings_calibrated = ou.interpolate(
-            coef=self.calibration_coefficients.coef_inter_modal_calibration[domain_id],
-            a=prototypes_vision,
-            b=prototypes_text[prototypes_vision_labels % self.num_classes]
-        )
+        if cfg.use_inter_modal_calibration:
+            embeddings_calibrated = ou.interpolate(
+                coef=self.calibration_coefficients.coef_inter_modal_calibration[domain_id],
+                a=prototypes_vision,
+                b=prototypes_text[prototypes_vision_labels % self.num_classes]
+            )
+        else:
+            embeddings_calibrated = prototypes_vision
         
         prototypes, _, prototypes_labels = self.calculate_means_and_covariances(
             embeddings_all=embeddings_calibrated,
@@ -1087,7 +1081,7 @@ class CVLC:
     
     def forward_text(
         self,
-        texts: Union[str, List[str]],
+        texts: Union[str, list[str]],
         domain_ids: int | T | None,
         use_power_norm: bool = True,
         normalize: bool = True,
@@ -1262,6 +1256,9 @@ class CVLC:
             shift=shift
         )
         
+        if not cfg.use_synonyms_interpolation:
+            return prototypes_original_class_names
+        
         names_list_all = []
         
         for i, name in enumerate(self.class_names):
@@ -1366,6 +1363,8 @@ class CVLC:
         assert isinstance(domain_id, int) or domain_id is None
         
         criterion = cfg.prototype_calculation_mode_text
+        if cfg.use_real_class_names:
+            criterion = nt.PrototypeTextModality.Templates
             
         if criterion == nt.PrototypeTextModality.Templates:
             prototypes_text, _ = self.compute_text_prototypes_with_templates(
@@ -1406,7 +1405,7 @@ class CVLC:
         normalize: bool = True,
         shift: bool = True,
         use_PEFT: bool = True
-    ) -> Dict[int, T]:
+    ) -> dict[int, T]:
         # Note: We use this method for evaluation of the test set.
         shared_arguments = dict(
             use_power_norm=use_power_norm,
@@ -1509,16 +1508,22 @@ class CVLC:
     def calculate_accuracy_per_domain(
         self,
         labels_predicted: T,
-        labels_ground_truth: T
+        labels_ground_truth: T,
+        true_domain_ids: T = None,
+        num_domains: int = None,
     ):
         cfg = self.cfg
-        true_domains_ids = self.label_to_domain_id[labels_ground_truth]
+        if true_domain_ids is None:
+            true_domain_ids = self.label_to_domain_id[labels_ground_truth]
+        if num_domains is None:
+            num_domains = cfg.current_domain_id + 1
 
-        acc_per_domain = torch.zeros(cfg.current_domain_id + 1)
+        acc_per_domain = torch.zeros(num_domains)
 
-        for domain_id in range(cfg.current_domain_id + 1):
-            mask = true_domains_ids == domain_id
-            acc_per_domain[domain_id] = self.calculate_accuracy(labels_predicted=labels_predicted[mask], labels_ground_truth=labels_ground_truth[mask])
+        for domain_id in range(num_domains):
+            mask = true_domain_ids == domain_id
+            if mask.any():
+                acc_per_domain[domain_id] = self.calculate_accuracy(labels_predicted=labels_predicted[mask], labels_ground_truth=labels_ground_truth[mask])
             
         average_accuracy = acc_per_domain.mean()
             
@@ -1536,6 +1541,20 @@ class CVLC:
         acc = 100.0 * (labels_predicted % self.num_classes == labels_ground_truth % self.num_classes).float().mean().item()
         return acc
     
+    def _official_ni_test_session_ids_from_indices(self, indices: T) -> T:
+        session_to_id = {name: i for i, name in enumerate(self.test_session_names)}
+        session_ids = []
+        for index in indices.tolist():
+            path = self.test_loader.dataset.images[int(index)]
+            session_name = parse_core50_session_name(path)
+            if session_name not in session_to_id:
+                raise ValueError(
+                    f"Unexpected official NI test session '{session_name}' in {path}. "
+                    f"Expected one of {self.test_session_names}."
+                )
+            session_ids.append(session_to_id[session_name])
+        return torch.tensor(session_ids, dtype=torch.long, device=self.device)
+
     @torch.no_grad()
     def evaluate_on_test_set(
         self,
@@ -1547,6 +1566,11 @@ class CVLC:
     ):
         cfg = self.cfg
         logging.info(f"Evaluating on the test set after domain {cfg.current_domain_id + 1}/{cfg.total_sessions} ...")
+        if cfg.core50_use_official_ni:
+            logging.info(
+                f"Official NI evaluation on held-out sessions {self.test_session_names} "
+                "(oracle domain IDs are unavailable)."
+            )
         
         labels_predicted_all = torch.tensor([], dtype=torch.long, device=self.device)
         labels_predicted_all_with_oracle = torch.tensor([], dtype=torch.long, device=self.device)
@@ -1554,6 +1578,7 @@ class CVLC:
         
         domain_ids_predicted_all = torch.tensor([], dtype=torch.long, device=self.device)
         domain_ids_oracle_all = torch.tensor([], dtype=torch.long, device=self.device)
+        test_session_ids_all = torch.tensor([], dtype=torch.long, device=self.device)
         
         shared_arguments = dict(
             normalize=normalize,
@@ -1570,14 +1595,20 @@ class CVLC:
         ert = ou.EstimatedRemainingTime(total_tasks=num_batches)
         
         for iter_num, batch in enumerate(self.test_loader):
-            _, [images_not_aug], labels_test = batch
+            indices, [images_not_aug], labels_test = batch
             
             domain_ids_predicted: T = self._predict_task_ids(images_not_aug)
             
             domain_ids_predicted_all = torch.cat([domain_ids_predicted_all, domain_ids_predicted], dim=0)
             
-            domain_id_oracle = self.label_to_domain_id[labels_test]
-            domain_ids_oracle_all = torch.cat([domain_ids_oracle_all, domain_id_oracle], dim=0)
+            if cfg.core50_use_official_ni:
+                test_session_ids_all = torch.cat(
+                    [test_session_ids_all, self._official_ni_test_session_ids_from_indices(indices)],
+                    dim=0
+                )
+            else:
+                domain_id_oracle = self.label_to_domain_id[labels_test]
+                domain_ids_oracle_all = torch.cat([domain_ids_oracle_all, domain_id_oracle], dim=0)
             
             # Without Oracle
             
@@ -1603,6 +1634,7 @@ class CVLC:
                         coef_inter_modal_calibration=self.calibration_coefficients.coef_inter_modal_calibration[domain_id],
                         coef_visual_prototypes_calibration=self.calibration_coefficients.coef_visual_prototypes_calibration[domain_id],
                         calibrate_vision_prototypes=cfg.calibrate_vision_prototypes,
+                        use_inter_modal_calibration=cfg.use_inter_modal_calibration,
                         domain_id=domain_id
                     )
                     
@@ -1620,43 +1652,44 @@ class CVLC:
                 
             labels_test_all = torch.cat([labels_test_all, labels_test.to(self.device)], dim=0)
             
-            # With Oracle (We reveal the domain IDs for the Oracle)
-            embeddings_vision_oracle = self.forward_vision(
-                images=images_not_aug,
-                domain_ids=domain_id_oracle,
-                calibration=calibration,
-                **shared_arguments
-            )
-            
-            if normalize:
-                embeddings_vision_oracle = F.normalize(embeddings_vision_oracle, dim=-1)
-            
-            labels_predicted_current_batch = torch.zeros(len(images_not_aug), dtype=torch.long, device=self.device) - 1
-                
-            for domain_id in domain_id_to_prototypes_text_dict.keys():
-                mask = domain_id_oracle == domain_id
-                
-                logits_fused_chosen_domain = self.classifiers.forward_and_bimodal_calibration_with_final_prototypes(
-                    embeddings_vision=embeddings_vision_oracle[mask],
-                    prototypes_text=domain_id_to_prototypes_text_dict[domain_id],
-                    coef_inter_modal_calibration=self.calibration_coefficients.coef_inter_modal_calibration[domain_id],
-                    coef_visual_prototypes_calibration=self.calibration_coefficients.coef_visual_prototypes_calibration[domain_id],
-                    calibrate_vision_prototypes=cfg.calibrate_vision_prototypes,
-                    domain_id=domain_id
+            if not cfg.core50_use_official_ni:
+                # With Oracle (We reveal the domain IDs for the Oracle)
+                embeddings_vision_oracle = self.forward_vision(
+                    images=images_not_aug,
+                    domain_ids=domain_id_oracle,
+                    calibration=calibration,
+                    **shared_arguments
                 )
                 
-                labels_predicted_current_batch[mask] = logits_fused_chosen_domain.argmax(dim=-1) + (domain_id * self.num_classes)
+                if normalize:
+                    embeddings_vision_oracle = F.normalize(embeddings_vision_oracle, dim=-1)
                 
-            labels_predicted_all_with_oracle = torch.cat([labels_predicted_all_with_oracle, labels_predicted_current_batch], dim=-1)
+                labels_predicted_current_batch = torch.zeros(len(images_not_aug), dtype=torch.long, device=self.device) - 1
+                    
+                for domain_id in domain_id_to_prototypes_text_dict.keys():
+                    mask = domain_id_oracle == domain_id
+                    
+                    logits_fused_chosen_domain = self.classifiers.forward_and_bimodal_calibration_with_final_prototypes(
+                        embeddings_vision=embeddings_vision_oracle[mask],
+                        prototypes_text=domain_id_to_prototypes_text_dict[domain_id],
+                        coef_inter_modal_calibration=self.calibration_coefficients.coef_inter_modal_calibration[domain_id],
+                        coef_visual_prototypes_calibration=self.calibration_coefficients.coef_visual_prototypes_calibration[domain_id],
+                        calibrate_vision_prototypes=cfg.calibrate_vision_prototypes,
+                        use_inter_modal_calibration=cfg.use_inter_modal_calibration,
+                        domain_id=domain_id
+                    )
+                    
+                    labels_predicted_current_batch[mask] = logits_fused_chosen_domain.argmax(dim=-1) + (domain_id * self.num_classes)
+                    
+                labels_predicted_all_with_oracle = torch.cat([labels_predicted_all_with_oracle, labels_predicted_current_batch], dim=-1)
             
             if iter_num % 10 == 9:
-                _, acc_temp = self.calculate_accuracy_per_domain(labels_predicted_all, labels_ground_truth=labels_test_all)
+                acc_temp = self.calculate_accuracy(labels_predicted_all, labels_test_all)
+                report_temp = f"Batch: {iter_num + 1}/{num_batches}, Domain: {cfg.current_domain_id + 1}/{cfg.total_sessions}, Acc. (w/o Oracle) {acc_temp:.2f}"
                 
-                report_temp = f"Batch: {iter_num + 1}/{num_batches}, Domain: {cfg.current_domain_id + 1}/{cfg.total_sessions}, AA (w/o Oracle) {acc_temp:.2f}"
-                
-                _, acc_temp = self.calculate_accuracy_per_domain(labels_predicted_all_with_oracle, labels_ground_truth=labels_test_all)
-                
-                report_temp += f", AA (with Oracle) {acc_temp:.2f}"
+                if not cfg.core50_use_official_ni:
+                    acc_temp = self.calculate_accuracy(labels_predicted_all_with_oracle, labels_test_all)
+                    report_temp += f", Acc. (with Oracle) {acc_temp:.2f}"
                 
                 remaining_time_str = ert.calculate(num_finished_tasks=iter_num)
                     
@@ -1665,18 +1698,104 @@ class CVLC:
             if cfg.debugging and cfg.current_domain_id == 0 and iter_num > 10:
                 break
             
-        acc_per_domain_without_oracle, _ = self.calculate_accuracy_per_domain(labels_predicted_all, labels_ground_truth=labels_test_all)
-        
-        acc_per_domain_with_oracle, _ = self.calculate_accuracy_per_domain(labels_predicted_all_with_oracle, labels_ground_truth=labels_test_all)
-        # logging.info(f'Acc. (with Oracle): {acc_with_oracle:.2f}')
-    
-        acc_domain_id = self.calculate_accuracy(domain_ids_predicted_all, domain_ids_oracle_all)
-        
         acc_without_oracle = self.calculate_accuracy(labels_predicted_all, labels_test_all)
         
-        acc_with_oracle = self.calculate_accuracy(labels_predicted_all_with_oracle, labels_test_all)
+        if cfg.core50_use_official_ni:
+            acc_per_domain_without_oracle, _ = self.calculate_accuracy_per_domain(
+                labels_predicted_all,
+                labels_ground_truth=labels_test_all,
+                true_domain_ids=test_session_ids_all,
+                num_domains=len(self.test_session_names)
+            )
+            acc_per_domain_with_oracle = acc_per_domain_without_oracle
+            acc_with_oracle = acc_without_oracle
+            acc_domain_id = 0.0
+        else:
+            acc_per_domain_without_oracle, _ = self.calculate_accuracy_per_domain(labels_predicted_all, labels_ground_truth=labels_test_all)
+            acc_per_domain_with_oracle, _ = self.calculate_accuracy_per_domain(labels_predicted_all_with_oracle, labels_ground_truth=labels_test_all)
+            acc_domain_id = self.calculate_accuracy(domain_ids_predicted_all, domain_ids_oracle_all)
+            acc_with_oracle = self.calculate_accuracy(labels_predicted_all_with_oracle, labels_test_all)
     
         return acc_without_oracle, acc_with_oracle, acc_per_domain_without_oracle, acc_per_domain_with_oracle, acc_domain_id
+    
+    @torch.no_grad()
+    def evaluate_zero_shot_clip(self):
+        """Zero-shot CLIP: With class_names and the first prompt template.
+        
+        Frozen CLIP is used without PEFT, shift, power-norm, or calibration.
+        Predictions are class IDs in [0, num_classes). Domain-aware labels are
+        compared with modulo arithmetic in calculate_accuracy.
+        """
+        cfg = self.cfg
+        logging.info(
+            f"Zero-shot CLIP evaluation after domain {cfg.current_domain_id + 1}/{cfg.total_sessions} ..."
+        )
+        
+        if self.class_names is None or len(self.class_names) != self.num_classes:
+            raise ValueError("class_names are required for zero-shot CLIP evaluation.")
+        if not cfg.CLIP_templates:
+            raise ValueError("At least one CLIP template is required for zero-shot evaluation.")
+        
+        template = cfg.CLIP_templates[0]
+        # texts = [template.format(class_name=name) for name in self.class_names]
+        texts = [template.format(class_name=name) for name in self.class_names_real]
+        logging.info(f"Zero-shot CLIP template: {template}")
+        logging.info(f"Zero-shot CLIP example prompt: {texts[0]}")
+        
+        text_tokens = clip.tokenize(texts).to(self.device)
+        text_embeddings = self.model.encode_text(text_tokens)
+        text_embeddings = F.normalize(text_embeddings.float(), dim=-1)
+        
+        test_dataset = self.data_manager.get_dataset(
+            np.arange(0, self.num_classes if cfg.core50_use_official_ni else self._total_classes),
+            source="test",
+            aug_modes_list=["clip"],
+            num_shots=-1
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=cfg.batch_size,
+            drop_last=False,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            persistent_workers=False
+        )
+        
+        labels_predicted_all = torch.tensor([], dtype=torch.long, device=self.device)
+        labels_test_all = torch.tensor([], dtype=torch.long, device=self.device)
+        
+        num_batches = len(test_loader)
+        ert = ou.EstimatedRemainingTime(total_tasks=num_batches)
+        
+        for iter_num, batch in enumerate(test_loader):
+            _, [images], labels_test = batch
+            images = images.to(self.device)
+            
+            image_embeddings = self.model.encode_image(images)
+            image_embeddings = F.normalize(image_embeddings.float(), dim=-1)
+            
+            logits = image_embeddings @ text_embeddings.T
+            labels_predicted = logits.argmax(dim=-1)
+            
+            labels_predicted_all = torch.cat([labels_predicted_all, labels_predicted], dim=0)
+            labels_test_all = torch.cat([labels_test_all, labels_test.to(self.device)], dim=0)
+            
+            if iter_num % 10 == 9 or iter_num + 1 == num_batches:
+                acc_temp = self.calculate_accuracy(labels_predicted_all, labels_test_all)
+                remaining_time_str = ert.calculate(num_finished_tasks=iter_num)
+                ou.print_overwrite(
+                    f"Zero-shot CLIP -> Batch: {iter_num + 1}/{num_batches}, Acc. {acc_temp:.2f}, {remaining_time_str}"
+                )
+            
+            if cfg.debugging and cfg.current_domain_id == 0 and iter_num > 10:
+                break
+        
+        acc = self.calculate_accuracy(labels_predicted_all, labels_test_all)
+        acc_per_domain, _ = self.calculate_accuracy_per_domain(labels_predicted_all, labels_test_all)
+        
+        # Frozen CLIP has no domain-specific parameters, so Oracle == non-Oracle.
+        # There is also no domain-ID predictor in this setting.
+        return acc, acc, acc_per_domain, acc_per_domain, 0.0
     
     def obtain_visual_embeddings_and_labels_for_all_samples(
         self,
@@ -1774,7 +1893,7 @@ class CVLC:
             if cfg.ignore_domain:
                 labels_all = labels_all % self.num_classes
             
-            return embeddings_all.to(self.device), labels_all
+            return embeddings_all, labels_all
         
         embeddings_all_final = torch.tensor([])
         labels_all_final = torch.tensor([], dtype=torch.long)
@@ -1872,6 +1991,9 @@ class CVLC:
                 **other_arguments
             )
 
+            means_over_classes = means_over_classes.to(embeddings.device)
+            covariance_inverses = covariance_inverses.to(embeddings.device)
+
             num_labels, _ = means_over_classes.shape
             
             distances_over_classes_list = []
@@ -1921,6 +2043,10 @@ class CVLC:
             
     def import_and_verify_descriptions(self):
         cfg = self.cfg
+        
+        if cfg.use_real_class_names:
+            logging.info("Skipping synonym loading because use_real_class_names is enabled.")
+            return
         
         if cfg.prototype_calculation_mode_text in [nt.PrototypeTextModality.WeightedSynonyms, nt.PrototypeTextModality.WeightedClassNamesAndSynonyms] and os.path.exists(cfg.synonyms_json_file_path):
             with open(cfg.synonyms_json_file_path, 'r') as file:
@@ -1977,9 +2103,25 @@ class CVLC:
         self.data_manager = data_manager
         self.num_classes = data_manager.num_classes
         self.class_names = data_manager.class_names
+        self.class_names_real = [str(name) for name in data_manager.class_names_real]
+        if cfg.use_real_class_names:
+            self.class_names = list(self.class_names_real)
+            if cfg.prototype_calculation_mode_text != nt.PrototypeTextModality.Templates:
+                logging.info(
+                    "Overriding prototype_calculation_mode_text from "
+                    f"{cfg.prototype_calculation_mode_text} to Templates because "
+                    "use_real_class_names disables weighted synonyms."
+                )
+                cfg.prototype_calculation_mode_text = nt.PrototypeTextModality.Templates
+            logging.info("Using real class names with a single template and no weighted synonyms.")
+            logging.info(f"Example real class name: {self.class_names[0]}")
+            logging.info(f"CLIP templates: {cfg.CLIP_templates}")
         self.domain_names_for_this_order = data_manager.domain_names_for_this_order
+        self.test_session_names = getattr(data_manager, "test_session_names", list(CORE50_OFFICIAL_NI_TEST_SESSIONS))
         
         logging.info(f'Domains: {self.domain_names_for_this_order}')
+        if cfg.core50_use_official_ni:
+            logging.info(f'Official NI test sessions: {self.test_session_names}')
         pass
     
     def _prepare_dataloaders(self):
@@ -2002,7 +2144,13 @@ class CVLC:
         self.train_loader = DataLoader(train_dataset, batch_size=batch_size_train, drop_last=drop_last_train, shuffle=True, **args_common_data_loader)
 
         # We use all samples from the test set.
-        test_dataset = self.data_manager.get_dataset(np.arange(0, self._total_classes), source="test", aug_modes_list=["test"], num_shots=-1)
+        if cfg.core50_use_official_ni:
+            # Official NI always evaluates on the fixed held-out sessions s3, s7, s10
+            # whose labels are class IDs in [0, num_classes).
+            test_class_indices = np.arange(0, self.num_classes)
+        else:
+            test_class_indices = np.arange(0, self._total_classes)
+        test_dataset = self.data_manager.get_dataset(test_class_indices, source="test", aug_modes_list=["test"], num_shots=-1)
         self.test_loader = DataLoader(test_dataset, batch_size=cfg.batch_size, drop_last=False, shuffle=True, **args_common_data_loader)
         
 def mahalanobis(
